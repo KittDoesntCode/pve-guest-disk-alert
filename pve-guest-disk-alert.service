@@ -1,0 +1,26 @@
+# Copyright (C) 2026 KittDoesntCode
+# SPDX-License-Identifier: AGPL-3.0-only
+
+[Unit]
+Description=Proxmox guest and host disk-usage alert monitor
+Documentation=man:systemd.service(5)
+Wants=network-online.target
+After=network-online.target pve-cluster.service
+
+[Service]
+Type=oneshot
+
+User=root
+Group=root
+
+ExecStart=/usr/local/sbin/pve-guest-disk-alert
+
+# Captures stdout/stderr in:
+# journalctl -u pve-guest-disk-alert.service
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pve-guest-disk-alert
+
+# The script has a 30-second timeout per guest command. This is an outer
+# protection so one execution cannot remain stuck indefinitely.
+TimeoutStartSec=10min
