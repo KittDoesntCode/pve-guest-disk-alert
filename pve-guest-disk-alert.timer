@@ -1,0 +1,21 @@
+# Copyright (C) 2026 KittDoesntCode
+# SPDX-License-Identifier: AGPL-3.0-only
+
+[Unit]
+Description=Run Proxmox guest and host disk-usage monitor every 15 minutes
+
+[Timer]
+# Run on the quarter hour: :00, :15, :30, and :45.
+OnCalendar=*-*-* *:0/15:00
+
+# If a scheduled time was missed because the host was off, run one catch-up
+# invocation when the timer becomes active again.
+Persistent=true
+
+# Avoid an arbitrary timer delay; especially useful for queued alerts at 07:00.
+AccuracySec=1s
+
+Unit=pve-guest-disk-alert.service
+
+[Install]
+WantedBy=timers.target
