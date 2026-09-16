@@ -174,35 +174,121 @@ systemd-analyze verify \
 
 No output from `systemd-analyze verify` normally means the unit files are valid.
 
-### Option B: Use the included installer
+### Option B: Install from GitHub
 
-Review the installer first:
+This method downloads the current release files from the GitHub `main` branch,
+installs them in their final locations, creates the protected state directory,
+reloads systemd, and validates the installed script and unit files.
+
+> Review the installer source on GitHub before running it. It runs as root and
+> installs files under `/usr/local/sbin` and `/etc/systemd/system`.
+
+#### Install without enabling the timer
+
+Use this for the initial installation so you can test behavior before the
+monitor begins running automatically:
 
 ```bash
-less install.sh
+curl -fsSL --proto '=https' --tlsv1.2 \
+  [https://raw.githubusercontent.com/KittDoesntCode/pve-guest-disk-alert/main/install.sh](https://raw.githubusercontent.com/KittDoesntCode/pve-guest-disk-alert/main/install.sh) \
+  | sudo bash -s -- --no-enable
 ```
 
-Run it as root:
+The installer will:
+
+- Download `pve-guest-disk-alert`, `pve-guest-disk-alert.service`, and `pve-guest-disk-alert.timer`.
+- Validate the downloaded Bash script and systemd unit files.
+- Back up existing installed files under `/root/pve-guest-disk-alert-backup-<timestamp>/`.
+- Install the script with mode `0750`.
+- Install systemd unit files with mode `0644`.
+- Create `/var/lib/pve-guest-disk-alert` with mode `0700`.
+- Reload systemd.
+- Leave the timer disabled.
+
+#### Test the monitor
+
+First run a broad dry run. This checks all qualifying filesystems but does not
+write state or send notifications:
 
 ```bash
-sudo ./install.sh
+/usr/local/sbin/pve-guest-disk-alert \
+  --threshold 1 \
+  --dry-run \
+  --verbose
 ```
 
-The installer:
-
-- Validates the script syntax.
-- Backs up existing installed files.
-- Installs the script with mode `0750`.
-- Installs systemd unit files with mode `0644`.
-- Creates the root-only state directory.
-- Reloads systemd.
-- Validates the installed systemd unit files.
-- Does not enable the timer automatically.
-
-To install and enable the timer in one step:
+Then confirm the actual production alert selection:
 
 ```bash
-sudo ./install.sh --enable
+/usr/local/sbin/pve-guest-disk-alert \
+  --threshold 90 \
+  --dry-run \
+  --verbose
+```
+
+Review the output before continuing. In the example environment, only LXC 108
+`/mnt/hdd` should currently alert at 90%.
+
+#### Send one real test alert
+
+After confirming the 90% dry-run output, run the monitor once without
+`--dry-run`:
+
+```bash
+/usr/local/sbin/pve-guest-disk-alert --threshold 90 --verbose
+```
+
+Confirm that the expected email and Pushover notification arrive.
+
+Immediately run it again to confirm same-day duplicate suppression:
+
+```bash
+/usr/local/sbin/pve-guest-disk-alert --threshold 90 --verbose
+```
+
+The second run should not send another alert for a filesystem that remains
+above the threshold.
+
+#### Enable the timer
+
+After testing succeeds, enable and start the 15-minute systemd timer:
+
+```bash
+systemctl enable --now pve-guest-disk-alert.timer
+```
+
+Verify the timer and its next scheduled run:
+
+```bash
+systemctl status pve-guest-disk-alert.timer --no-pager
+systemctl list-timers pve-guest-disk-alert.timer --all
+```
+
+To view monitor logs:
+
+```bash
+journalctl -u pve-guest-disk-alert.service --since today --no-pager
+```
+
+#### Re-run the installer
+
+You can also re-run the installer without `--no-enable` to install the latest
+files and enable/start the timer:
+
+```bash
+curl -fsSL --proto '=https' --tlsv1.2 \
+  [https://raw.githubusercontent.com/KittDoesntCode/pve-guest-disk-alert/main/install.sh](https://raw.githubusercontent.com/KittDoesntCode/pve-guest-disk-alert/main/install.sh) \
+  | sudo bash
+```
+
+For upgrades where the timer is already enabled, use `--refresh`. This
+reinstalls and validates the latest files while preserving the timer's existing
+enabled and active state:
+
+```bash
+curl -fsSL --proto '=https' --tlsv1.2 \
+  [https://raw.githubusercontent.com/KittDoesntCode/pve-guest-disk-alert/main/install.sh](https://raw.githubusercontent.com/KittDoesntCode/pve-guest-disk-alert/main/install.sh) \
+  | sudo bash -s -- --refresh
 ```
 
 ## Configuration
