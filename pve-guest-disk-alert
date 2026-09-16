@@ -1,0 +1,798 @@
+#!/usr/bin/env bash
+#
+# pve-guest-disk-alert
+# Lightweight disk-usage alerting for Proxmox VE guests and host storage.
+#
+# Copyright (C) 2026 KittDoesntCode
+#
+# This program is free software: you can redistribute it and/or modify it under
+# the terms of the GNU Affero General Public License as published by the Free
+# Software Foundation, version 3 of the License.
+#
+# This program is distributed WITHOUT ANY WARRANTY; without even the implied
+# warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+# Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
+#
+#
+# VM source:  qm agent <vmid> get-fsinfo
+# LXC source: pct df <vmid>
+# Host source: df --block-size=1
+#
+# Safe test:
+#   /usr/local/sbin/pve-guest-disk-alert --threshold 1 --dry-run --verbose
+#
+# Notifications are submitted to local root using /usr/sbin/sendmail.
+# Ensure local root mail is routed to your intended email/Pushover path.
+#
+
+set -Eeuo pipefail
+PATH='/usr/sbin:/usr/bin:/sbin:/bin'
+
+# ------------------------------------------------------------------------------
+# Configuration
+# ------------------------------------------------------------------------------
+
+DEFAULT_THRESHOLD=90
+TIME_ZONE='America/New_York'
+
+# Quiet from QUIET_START_HOUR:00 inclusive to QUIET_END_HOUR:00 exclusive.
+# Defaults to no notifications from midnight through 06:59.
+# Set both values equal to disable quiet hours.
+QUIET_START_HOUR=0
+QUIET_END_HOUR=7
+
+MONITOR_HOST_FILESYSTEMS=true
+
+# Empty arrays mean: monitor every running VM and LXC.
+IGNORE_GUEST_IDS=()
+ALLOW_GUEST_IDS=()
+
+# Per-command timeout for qm agent and pct df.
+GUEST_COMMAND_TIMEOUT=30
+
+# ------------------------------------------------------------------------------
+# Internal settings
+# ------------------------------------------------------------------------------
+
+readonly PROGRAM_NAME="${0##*/}"
+readonly STATE_DIR='/var/lib/pve-guest-disk-alert'
+readonly LOCK_FILE='/run/lock/pve-guest-disk-alert.lock'
+readonly MAIL_RECIPIENT='root'
+
+# EROFS excludes Home Assistant OS's immutable root image. Squashfs, loop
+# devices, USB-backed filesystems, and pseudo-filesystems are excluded below.
+readonly -a IGNORE_VM_TYPES=(
+    aufs autofs cgroup cgroup2 cgroupfs configfs debugfs devpts devtmpfs
+    efivarfs erofs fusectl hugetlbfs mqueue nsfs overlay proc pstore ramfs
+    securityfs squashfs sysfs tmpfs tracefs
+)
+
+# fuse excludes /etc/pve (pmxcfs) from host capacity monitoring.
+readonly -a IGNORE_HOST_TYPES=(
+    aufs autofs bpf cgroup cgroup2 cgroupfs configfs debugfs devpts devtmpfs
+    efivarfs fuse fusectl hugetlbfs mqueue nsfs overlay proc pstore ramfs
+    securityfs squashfs sysfs tmpfs tracefs
+)
+
+THRESHOLD="$DEFAULT_THRESHOLD"
+DRY_RUN=false
+VERBOSE=false
+HOSTNAME_SHORT=''
+TODAY=''
+
+declare -A IGNORE_SET=()
+declare -A ALLOW_SET=()
+declare -A HIGH_LINES=()
+declare -A RECOVERY_LINES=()
+declare -A HIGH_FILES=()
+declare -A RECOVERY_FILES=()
+
+# ------------------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------------------
+
+usage() {
+    cat <<EOF
+Usage: ${PROGRAM_NAME} [OPTIONS]
+
+Options:
+  --threshold N   Alert at N percent or higher; N must be 1 through 100.
+  --dry-run       Print notification content; do not write state or send mail.
+  --verbose       Print processing details to stderr/journald.
+  --help          Display this help.
+
+Examples:
+  ${PROGRAM_NAME}
+  ${PROGRAM_NAME} --threshold 95
+  ${PROGRAM_NAME} --threshold 1 --dry-run --verbose
+EOF
+}
+
+has_command() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+log_info() {
+    [[ "$VERBOSE" == true ]] || return 0
+    printf '%s: INFO: %s\n' "$PROGRAM_NAME" "$*" >&2
+}
+
+log_warning() {
+    printf '%s: WARNING: %s\n' "$PROGRAM_NAME" "$*" >&2
+    logger -p user.warning -t "$PROGRAM_NAME" -- "$*"
+}
+
+log_error() {
+    printf '%s: ERROR: %s\n' "$PROGRAM_NAME" "$*" >&2
+    logger -p user.err -t "$PROGRAM_NAME" -- "$*"
+}
+
+fatal() {
+    log_error "$*"
+    exit 1
+}
+
+in_array() {
+    local needle="$1"
+    shift
+    local item
+
+    for item in "$@"; do
+        [[ "$item" == "$needle" ]] && return 0
+    done
+
+    return 1
+}
+
+guest_selected() {
+    local vmid="$1"
+
+    [[ -z "${IGNORE_SET[$vmid]+x}" ]] || return 1
+
+    if (( ${#ALLOW_SET[@]} > 0 )); then
+        [[ -n "${ALLOW_SET[$vmid]+x}" ]] || return 1
+    fi
+
+    return 0
+}
+
+safe_text() {
+    # Prevent externally supplied guest data from inserting new lines or tabs.
+    tr '\r\n\t' '   ' <<<"$1"
+}
+
+format_bytes() {
+    local bytes="$1"
+
+    if (( bytes < 1024 )); then
+        printf '%s B' "$bytes"
+    elif (( bytes < 1024 ** 2 )); then
+        awk -v b="$bytes" 'BEGIN { printf "%.1f KiB", b / 1024 }'
+    elif (( bytes < 1024 ** 3 )); then
+        awk -v b="$bytes" 'BEGIN { printf "%.1f MiB", b / 1048576 }'
+    elif (( bytes < 1024 ** 4 )); then
+        awk -v b="$bytes" 'BEGIN { printf "%.1f GiB", b / 1073741824 }'
+    elif (( bytes < 1024 ** 5 )); then
+        awk -v b="$bytes" 'BEGIN { printf "%.1f TiB", b / 1099511627776 }'
+    else
+        awk -v b="$bytes" 'BEGIN { printf "%.1f PiB", b / 1125899906842624 }'
+    fi
+}
+
+append_value() {
+    local -n map="$1"
+    local key="$2"
+    local value="$3"
+
+    if [[ -n "${map[$key]+x}" ]]; then
+        map["$key"]+=$'\n'"$value"
+    else
+        map["$key"]="$value"
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# State
+# ------------------------------------------------------------------------------
+
+state_file() {
+    local state_key="$1"
+    local hash
+
+    hash="$(printf '%s' "$state_key" | sha256sum | awk '{print $1}')"
+    printf '%s/%s.state' "$STATE_DIR" "$hash"
+}
+
+state_get() {
+    # State contains only fixed key=value records and is never sourced.
+    local file="$1"
+    local wanted_key="$2"
+    local key value
+
+    [[ -r "$file" ]] || return 0
+
+    while IFS='=' read -r key value; do
+        if [[ "$key" == "$wanted_key" ]]; then
+            printf '%s' "$value"
+            return 0
+        fi
+    done <"$file"
+}
+
+write_state() {
+    # file high last_sent pending_high pending_recovery
+    local file="$1"
+    local high="$2"
+    local last_sent="$3"
+    local pending_high="$4"
+    local pending_recovery="$5"
+    local temp_file
+
+    [[ "$DRY_RUN" == true ]] && return 0
+
+    temp_file="$(mktemp "${STATE_DIR}/.state.XXXXXXXX")"
+    chmod 0600 "$temp_file"
+
+    {
+        printf 'high=%s\n' "$high"
+        printf 'last_sent=%s\n' "$last_sent"
+        printf 'pending_high=%s\n' "$pending_high"
+        printf 'pending_recovery=%s\n' "$pending_recovery"
+    } >"$temp_file"
+
+    mv -f -- "$temp_file" "$file"
+}
+
+# ------------------------------------------------------------------------------
+# Notification state machine
+# ------------------------------------------------------------------------------
+
+notifications_allowed() {
+    local hour
+
+    hour="$(TZ="$TIME_ZONE" date '+%H')"
+    hour=$((10#$hour))
+
+    (( QUIET_START_HOUR == QUIET_END_HOUR )) && return 0
+
+    if (( QUIET_START_HOUR < QUIET_END_HOUR )); then
+        (( hour < QUIET_START_HOUR || hour >= QUIET_END_HOUR ))
+    else
+        (( hour >= QUIET_END_HOUR && hour < QUIET_START_HOUR ))
+    fi
+}
+
+send_notification() {
+    local subject="$1"
+    local body="$2"
+
+    if [[ "$DRY_RUN" == true ]]; then
+        printf '\n----- DRY RUN NOTIFICATION -----\n'
+        printf 'Subject: %s\n\n%s\n' "$subject" "$body"
+        printf '%s\n' '------------------------------'
+        return 0
+    fi
+
+    {
+        printf 'To: %s\n' "$MAIL_RECIPIENT"
+        printf 'Subject: %s\n' "$subject"
+        printf 'Auto-Submitted: auto-generated\n'
+        printf 'Content-Type: text/plain; charset=UTF-8\n'
+        printf '\n'
+        printf '%s\n' "$body"
+    } | /usr/sbin/sendmail -t -oi
+}
+
+queue_state() {
+    # entity filesystem-key mountpoint message-line high(0|1)
+    local entity="$1"
+    local filesystem_key="$2"
+    local mountpoint="$3"
+    local message_line="$4"
+    local is_high="$5"
+
+    local file
+    local high last_sent pending_high pending_recovery
+
+    file="$(state_file "${entity}|${filesystem_key}|${mountpoint}")"
+    high="$(state_get "$file" high)"
+    last_sent="$(state_get "$file" last_sent)"
+    pending_high="$(state_get "$file" pending_high)"
+    pending_recovery="$(state_get "$file" pending_recovery)"
+
+    [[ "$high" =~ ^[01]$ ]] || high=0
+    [[ "$pending_high" =~ ^[01]$ ]] || pending_high=0
+    [[ "$pending_recovery" =~ ^[01]$ ]] || pending_recovery=0
+    [[ "$last_sent" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || last_sent=''
+
+    if (( is_high == 1 )); then
+        if (( high == 0 )) || [[ "$last_sent" != "$TODAY" ]]; then
+            pending_high=1
+        fi
+
+        if (( pending_high == 1 )); then
+            append_value HIGH_LINES "$entity" "$message_line"
+            append_value HIGH_FILES "$entity" "$file"
+        fi
+
+        write_state "$file" 1 "$last_sent" "$pending_high" 0
+    else
+        if (( high == 1 )); then
+            pending_recovery=1
+        fi
+
+        if (( pending_recovery == 1 )); then
+            append_value RECOVERY_LINES "$entity" "$message_line"
+            append_value RECOVERY_FILES "$entity" "$file"
+        fi
+
+        write_state "$file" 0 "$last_sent" 0 "$pending_recovery"
+    fi
+}
+
+evaluate_bytes() {
+    # entity filesystem-key mountpoint type used-bytes total-bytes
+    local entity="$1"
+    local filesystem_key="$2"
+    local mountpoint="$3"
+    local filesystem_type="$4"
+    local used_bytes="$5"
+    local total_bytes="$6"
+
+    local percent=0
+    local is_high=0
+    local message_line
+
+    [[ "$used_bytes" =~ ^[0-9]+$ ]] || {
+        log_warning "Invalid used-byte value for ${entity} ${mountpoint}."
+        return 0
+    }
+
+    [[ "$total_bytes" =~ ^[0-9]+$ ]] && (( total_bytes > 0 )) || {
+        log_warning "Invalid total-byte value for ${entity} ${mountpoint}."
+        return 0
+    }
+
+    percent=$(( used_bytes * 100 / total_bytes ))
+    (( percent >= THRESHOLD )) && is_high=1
+
+    message_line="$(printf '%-30s %3d%%  (%s / %s)  type=%s' \
+        "$(safe_text "$mountpoint")" \
+        "$percent" \
+        "$(format_bytes "$used_bytes")" \
+        "$(format_bytes "$total_bytes")" \
+        "$(safe_text "$filesystem_type")")"
+
+    queue_state \
+        "$entity" \
+        "$filesystem_key" \
+        "$mountpoint" \
+        "$message_line" \
+        "$is_high"
+}
+
+evaluate_lxc() {
+    # entity filesystem-key mountpoint native-used native-size native-use-percent
+    local entity="$1"
+    local filesystem_key="$2"
+    local mountpoint="$3"
+    local used_display="$4"
+    local size_display="$5"
+    local percent_display="$6"
+
+    local percent_integer
+    local is_high=0
+    local message_line
+
+    [[ "$percent_display" =~ ^[0-9]+([.][0-9]+)?$ ]] || {
+        log_warning "Invalid pct df percentage for ${entity} ${mountpoint}: ${percent_display}"
+        return 0
+    }
+
+    if awk -v p="$percent_display" -v t="$THRESHOLD" 'BEGIN { exit !(p >= t) }'; then
+        is_high=1
+    fi
+
+    percent_integer="$(awk -v p="$percent_display" 'BEGIN { printf "%d", p }')"
+
+    message_line="$(printf '%-30s %3d%%  (%s / %s)  type=lxc-mount  pct-df=%s%%' \
+        "$(safe_text "$mountpoint")" \
+        "$percent_integer" \
+        "$(safe_text "$used_display")" \
+        "$(safe_text "$size_display")" \
+        "$percent_display")"
+
+    queue_state \
+        "$entity" \
+        "$filesystem_key" \
+        "$mountpoint" \
+        "$message_line" \
+        "$is_high"
+}
+
+mark_sent() {
+    # entity map-name high|recovery
+    local entity="$1"
+    local map_name="$2"
+    local notification_kind="$3"
+
+    local -n file_map="$map_name"
+    local file
+    local high last_sent pending_high pending_recovery
+
+    [[ -n "${file_map[$entity]+x}" ]] || return 0
+
+    while IFS= read -r file; do
+        [[ -n "$file" ]] || continue
+
+        high="$(state_get "$file" high)"
+        last_sent="$(state_get "$file" last_sent)"
+        pending_high="$(state_get "$file" pending_high)"
+        pending_recovery="$(state_get "$file" pending_recovery)"
+
+        [[ "$high" =~ ^[01]$ ]] || high=0
+        [[ "$pending_high" =~ ^[01]$ ]] || pending_high=0
+        [[ "$pending_recovery" =~ ^[01]$ ]] || pending_recovery=0
+
+        if [[ "$notification_kind" == high ]]; then
+            write_state "$file" "$high" "$TODAY" 0 "$pending_recovery"
+        else
+            write_state "$file" "$high" "$last_sent" "$pending_high" 0
+        fi
+    done <<<"${file_map[$entity]}"
+}
+
+# ------------------------------------------------------------------------------
+# Collection
+# ------------------------------------------------------------------------------
+
+check_vms() {
+    local vmid status json
+    local mountpoint name filesystem_type total_bytes used_bytes usb_backed
+    local entity
+
+    # qm list: VMID NAME STATUS MEM(MB) BOOTDISK(GB) PID
+    while IFS=' ' read -r vmid status; do
+        [[ -n "$vmid" ]] || continue
+
+        if [[ "$status" != running ]]; then
+            log_info "Skipping VM ${vmid}: status=${status}."
+            continue
+        fi
+
+        if ! guest_selected "$vmid"; then
+            log_info "Skipping VM ${vmid}: excluded."
+            continue
+        fi
+
+        entity="vm:${vmid}"
+        log_info "Checking VM ${vmid}."
+
+        if ! json="$(timeout "${GUEST_COMMAND_TIMEOUT}s" qm agent "$vmid" get-fsinfo 2>&1)"; then
+            log_warning "VM ${vmid}: qm agent get-fsinfo failed: $(safe_text "$json")"
+            continue
+        fi
+
+        if ! jq -e 'type == "array"' >/dev/null 2>&1 <<<"$json"; then
+            log_warning "VM ${vmid}: QEMU Guest Agent did not return a JSON array."
+            continue
+        fi
+
+        while IFS=$'\t' read -r mountpoint name filesystem_type total_bytes used_bytes usb_backed; do
+            [[ -n "$mountpoint" ]] || continue
+            in_array "$filesystem_type" "${IGNORE_VM_TYPES[@]}" && continue
+            [[ "$name" == loop* ]] && continue
+            [[ "$usb_backed" == true ]] && continue
+
+            evaluate_bytes \
+                "$entity" \
+                "${name}|${mountpoint}" \
+                "$mountpoint" \
+                "$filesystem_type" \
+                "$used_bytes" \
+                "$total_bytes"
+        done < <(
+            jq -r '
+                .[]
+                | select(
+                    (.mountpoint | type == "string" and length > 0) and
+                    (.name | type == "string") and
+                    (.type | type == "string") and
+                    (."total-bytes" | type == "number" and . > 0) and
+                    (."used-bytes" | type == "number" and . >= 0)
+                )
+                | [
+                    .mountpoint,
+                    .name,
+                    .type,
+                    (."total-bytes" | floor | tostring),
+                    (."used-bytes" | floor | tostring),
+                    (any(.disk[]?; ."bus-type"? == "usb") | tostring)
+                ]
+                | @tsv
+            ' <<<"$json"
+        )
+    done < <(qm list | awk 'NR > 1 { print $1, $3 }')
+}
+
+check_containers() {
+    local vmid status output
+    local mp volume size used available percent mountpoint
+    local entity
+    local first_line
+
+    # pct list: VMID STATUS LOCK NAME
+    while IFS=' ' read -r vmid status; do
+        [[ -n "$vmid" ]] || continue
+
+        if [[ "$status" != running ]]; then
+            log_info "Skipping LXC ${vmid}: status=${status}."
+            continue
+        fi
+
+        if ! guest_selected "$vmid"; then
+            log_info "Skipping LXC ${vmid}: excluded."
+            continue
+        fi
+
+        entity="ct:${vmid}"
+        log_info "Checking LXC ${vmid}."
+
+        if ! output="$(timeout "${GUEST_COMMAND_TIMEOUT}s" pct df "$vmid" 2>&1)"; then
+            log_warning "LXC ${vmid}: pct df failed: $(safe_text "$output")"
+            continue
+        fi
+
+        first_line=true
+
+        # pct df: MP Volume Size Used Avail Use% Path
+        while IFS=' ' read -r mp volume size used available percent mountpoint; do
+            if [[ "$first_line" == true ]]; then
+                first_line=false
+                continue
+            fi
+
+            [[ -n "$mp" ]] || continue
+            [[ -n "$volume" ]] || continue
+            [[ -n "$size" ]] || continue
+            [[ -n "$used" ]] || continue
+            [[ -n "$percent" ]] || continue
+            [[ -n "$mountpoint" ]] || continue
+
+            evaluate_lxc \
+                "$entity" \
+                "${mp}|${mountpoint}" \
+                "$mountpoint" \
+                "$used" \
+                "$size" \
+                "$percent"
+        done <<<"$output"
+    done < <(pct list | awk 'NR > 1 { print $1, $2 }')
+}
+
+check_host() {
+    local source filesystem_type total_bytes used_bytes available_bytes percent mountpoint
+
+    [[ "$MONITOR_HOST_FILESYSTEMS" == true ]] || return 0
+
+    log_info "Checking Proxmox host ${HOSTNAME_SHORT}."
+
+    while IFS=$'\t' read -r source filesystem_type total_bytes used_bytes available_bytes percent mountpoint; do
+        [[ -n "$source" ]] || continue
+        in_array "$filesystem_type" "${IGNORE_HOST_TYPES[@]}" && continue
+        [[ "$source" == /dev/loop* ]] && continue
+
+        evaluate_bytes \
+            host \
+            "${source}|${mountpoint}" \
+            "$mountpoint" \
+            "$filesystem_type" \
+            "$used_bytes" \
+            "$total_bytes"
+    done < <(
+        df --block-size=1 --output=source,fstype,size,used,avail,pcent,target \
+            -x tmpfs \
+            -x devtmpfs \
+            -x squashfs \
+            -x overlay \
+            2>/dev/null |
+        awk '
+            NR == 1 { next }
+            {
+                source=$1
+                type=$2
+                total=$3
+                used=$4
+                available=$5
+                percent=$6
+
+                $1=$2=$3=$4=$5=$6=""
+                sub(/^[[:space:]]+/, "", $0)
+
+                print source "\t" type "\t" total "\t" used "\t" available "\t" percent "\t" $0
+            }
+        '
+    )
+}
+
+# ------------------------------------------------------------------------------
+# Delivery
+# ------------------------------------------------------------------------------
+
+entity_name() {
+    case "$1" in
+        host) printf 'Proxmox host %s' "$HOSTNAME_SHORT" ;;
+        vm:*) printf 'VM %s' "${1#vm:}" ;;
+        ct:*) printf 'LXC %s' "${1#ct:}" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+dispatch_notifications() {
+    local entity name subject body
+
+    if ! notifications_allowed; then
+        log_info 'Quiet hours active; pending notifications retained.'
+        return 0
+    fi
+
+    for entity in "${!HIGH_LINES[@]}"; do
+        name="$(entity_name "$entity")"
+        subject="[PVE Disk Alert] ${name}: usage at or above ${THRESHOLD}%"
+
+        body="Disk usage alert from ${HOSTNAME_SHORT}
+
+Entity: ${name}
+Threshold: ${THRESHOLD}%
+Time: $(TZ="$TIME_ZONE" date '+%Y-%m-%d %H:%M:%S %Z')
+
+The following filesystem(s) are at or above the configured threshold:
+
+Mountpoint                      Use%  (used / total)  type
+${HIGH_LINES[$entity]}
+
+This condition alerts once initially and then at most once per calendar day until recovery."
+
+        if send_notification "$subject" "$body"; then
+            mark_sent "$entity" HIGH_FILES high
+
+            if [[ "$DRY_RUN" == true ]]; then
+                log_info "Dry-run: high alert would be sent for ${name}."
+            else
+                log_info "High alert handed to local sendmail for ${name}."
+            fi
+        else
+            log_error "High alert failed for ${name}; it remains pending."
+        fi
+    done
+
+    for entity in "${!RECOVERY_LINES[@]}"; do
+        name="$(entity_name "$entity")"
+        subject="[PVE Disk Recovery] ${name}: usage recovered"
+
+        body="Disk usage recovery from ${HOSTNAME_SHORT}
+
+Entity: ${name}
+Threshold: ${THRESHOLD}%
+Time: $(TZ="$TIME_ZONE" date '+%Y-%m-%d %H:%M:%S %Z')
+
+The following filesystem(s) are now below the configured threshold:
+
+Mountpoint                      Use%  (used / total)  type
+${RECOVERY_LINES[$entity]}
+
+The high-usage state has been cleared."
+
+        if send_notification "$subject" "$body"; then
+            mark_sent "$entity" RECOVERY_FILES recovery
+
+            if [[ "$DRY_RUN" == true ]]; then
+                log_info "Dry-run: recovery alert would be sent for ${name}."
+            else
+                log_info "Recovery alert handed to local sendmail for ${name}."
+            fi
+        else
+            log_error "Recovery alert failed for ${name}; it remains pending."
+        fi
+    done
+}
+
+# ------------------------------------------------------------------------------
+# Startup
+# ------------------------------------------------------------------------------
+
+parse_arguments() {
+    while (( $# > 0 )); do
+        case "$1" in
+            --threshold)
+                (( $# >= 2 )) || fatal '--threshold requires a value.'
+                THRESHOLD="$2"
+                shift 2
+                ;;
+            --dry-run)
+                DRY_RUN=true
+                shift
+                ;;
+            --verbose)
+                VERBOSE=true
+                shift
+                ;;
+            --help|-h)
+                usage
+                exit 0
+                ;;
+            *)
+                fatal "Unknown option: $1"
+                ;;
+        esac
+    done
+
+    [[ "$THRESHOLD" =~ ^[0-9]+$ ]] && (( THRESHOLD >= 1 && THRESHOLD <= 100 )) \
+        || fatal 'Threshold must be an integer from 1 through 100.'
+
+    (( QUIET_START_HOUR >= 0 && QUIET_START_HOUR <= 23 )) \
+        || fatal 'QUIET_START_HOUR must be from 0 through 23.'
+
+    (( QUIET_END_HOUR >= 0 && QUIET_END_HOUR <= 23 )) \
+        || fatal 'QUIET_END_HOUR must be from 0 through 23.'
+}
+
+validate_environment() {
+    local command vmid
+
+    [[ "$EUID" -eq 0 ]] || fatal 'Run this script as root.'
+
+    for command in \
+        awk date df flock hostname jq logger mkdir mktemp mv pct qm sendmail sha256sum timeout tr
+    do
+        has_command "$command" || fatal "Required command not found: ${command}"
+    done
+
+    [[ -x /usr/sbin/sendmail ]] || fatal '/usr/sbin/sendmail is not executable.'
+
+    TZ="$TIME_ZONE" date '+%F' >/dev/null 2>&1 \
+        || fatal "Invalid timezone: ${TIME_ZONE}"
+
+    mkdir -p -m 0700 "$STATE_DIR"
+    chmod 0700 "$STATE_DIR"
+
+    for vmid in "${IGNORE_GUEST_IDS[@]}"; do
+        [[ "$vmid" =~ ^[0-9]+$ ]] || fatal "Invalid ignored guest ID: ${vmid}"
+        IGNORE_SET["$vmid"]=1
+    done
+
+    for vmid in "${ALLOW_GUEST_IDS[@]}"; do
+        [[ "$vmid" =~ ^[0-9]+$ ]] || fatal "Invalid allowed guest ID: ${vmid}"
+        ALLOW_SET["$vmid"]=1
+    done
+}
+
+main() {
+    parse_arguments "$@"
+    validate_environment
+
+    mkdir -p -m 0755 "$(dirname "$LOCK_FILE")"
+
+    exec 9>"$LOCK_FILE"
+    if ! flock -n 9; then
+        log_warning 'Another monitor run is already active; skipping this run.'
+        exit 2
+    fi
+
+    HOSTNAME_SHORT="$(hostname -s)"
+    TODAY="$(TZ="$TIME_ZONE" date '+%F')"
+
+    log_info "Starting disk check: threshold=${THRESHOLD}%, timezone=${TIME_ZONE}, dry_run=${DRY_RUN}."
+
+    check_vms
+    check_containers
+    check_host
+    dispatch_notifications
+
+    log_info 'Disk check complete.'
+}
+
+main "$@"
